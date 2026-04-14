@@ -138,81 +138,92 @@ pub fn parse_bytes(bytes: &[u8]) -> Result<OutputMetadata, ParseError> {
 
 /// Return the start position of the outbox message union and its type.
 ///
-/// Scans right-to-left, collecting all structurally-valid candidates, then
-/// picks the best one using the Irmin-echo confirmation heuristic.
+/// Scans left-to-right (longest possible suffix first). For each position:
+///
+/// 1. **Irmin echo**: check that `bytes[pos..n]` appears verbatim somewhere in
+///    `bytes[0..pos]`. The Irmin proof stores the outbox message as a leaf-node
+///    value, so the true msg_start produces a long match; false positives from
+///    coincidental byte patterns produce only short matches.
+///
+/// 2. **Structure**: check that the suffix starts with a valid union tag and
+///    that the `Dynamic_size` list-length field (or the `0x00` None sentinel)
+///    is consistent with the remaining bytes.
+///
+/// Both signals must hold. If either fails we shrink the candidate by one byte
+/// (increment pos) and try again, naturally converging on the true split point.
 fn find_message_start(bytes: &[u8]) -> Result<(usize, MessageType), ParseError> {
     let n = bytes.len();
-    let mut candidates: Vec<(usize, MessageType)> = Vec::new();
 
-    // pos must be >= 5: 4 bytes for level + 1 byte for LEB128 minimum.
+    // pos >= 5: minimum room for 4-byte level + 1-byte LEB128 before the tag.
+    for pos in 5..n {
+        let msg = &bytes[pos..n];
+
+        // Echo check: suffix must fit inside the prefix and appear there.
+        if msg.len() > pos {
+            continue;
+        }
+        if !bytes[..pos].windows(msg.len()).any(|w| w == msg) {
+            continue;
+        }
+
+        // Structure check: must start with a valid tag and have consistent framing.
+        if let Some(kind) = message_kind(msg) {
+            return Ok((pos, kind));
+        }
+    }
+
+    // Fallback for proofs where the Irmin section doesn't embed the message
+    // verbatim (e.g. blinded/hashed leaf nodes). Revert to the structural scan
+    // with the LEB128 MSB-0 filter.
     for pos in (5..n).rev() {
-        match bytes[pos] {
-            t @ (0 | 1) if pos + 5 <= n => {
+        if bytes[pos - 1] & 0x80 != 0 {
+            continue;
+        }
+        let msg = &bytes[pos..n];
+        if let Some(kind) = message_kind(msg) {
+            return Ok((pos, kind));
+        }
+    }
+
+    Err(ParseError::MessageNotFound)
+}
+
+/// Check whether `msg` is a structurally valid serialised outbox message and
+/// return its type, or `None` if it fails the structural constraints.
+fn message_kind(msg: &[u8]) -> Option<MessageType> {
+    match *msg.first()? {
+        // AtomicTransactionBatch / AtomicTransactionBatchTyped:
+        //   [tag][4-byte list length L][L bytes]
+        t @ (0 | 1) => {
+            let list_len = u32::from_be_bytes(msg.get(1..5)?.try_into().ok()?) as usize;
+            if 5 + list_len == msg.len() {
+                Some(if t == 0 {
+                    MessageType::AtomicTransactionBatch
+                } else {
+                    MessageType::AtomicTransactionBatchTyped
+                })
+            } else {
+                None
+            }
+        }
+        // WhitelistUpdate:
+        //   Some(list): [0x02][0xFF][4-byte L][L bytes]
+        //   None:       [0x02][0x00]
+        2 => match *msg.get(1)? {
+            0xFF => {
                 let list_len =
-                    u32::from_be_bytes(bytes[pos + 1..pos + 5].try_into().unwrap()) as usize;
-                if pos + 5 + list_len == n {
-                    let kind = if t == 0 {
-                        MessageType::AtomicTransactionBatch
-                    } else {
-                        MessageType::AtomicTransactionBatchTyped
-                    };
-                    candidates.push((pos, kind));
+                    u32::from_be_bytes(msg.get(2..6)?.try_into().ok()?) as usize;
+                if 6 + list_len == msg.len() {
+                    Some(MessageType::WhitelistUpdate)
+                } else {
+                    None
                 }
             }
-            2 if pos + 1 < n => match bytes[pos + 1] {
-                0xFF if pos + 6 <= n => {
-                    let list_len = u32::from_be_bytes(
-                        bytes[pos + 2..pos + 6].try_into().unwrap(),
-                    ) as usize;
-                    if pos + 6 + list_len == n {
-                        candidates.push((pos, MessageType::WhitelistUpdate));
-                    }
-                }
-                0x00 if pos + 2 == n => {
-                    candidates.push((pos, MessageType::WhitelistUpdate));
-                }
-                _ => {}
-            },
-            _ => {}
-        }
+            0x00 if msg.len() == 2 => Some(MessageType::WhitelistUpdate),
+            _ => None,
+        },
+        _ => None,
     }
-
-    if candidates.is_empty() {
-        return Err(ParseError::MessageNotFound);
-    }
-
-    // Pick the candidate whose message bytes form the longest match inside the
-    // Irmin proof section (i.e. bytes[pos..n] appears verbatim in bytes[0..pos]).
-    //
-    // The Irmin proof embeds the outbox message bytes as a leaf-node value, so
-    // the true msg_start produces a long echo (all message bytes). False
-    // positives produce a short echo or none at all — a coincidental byte
-    // sequence of just a few bytes is far less distinctive.
-    //
-    // `candidates` is ordered right-to-left (largest pos first). Iterating it
-    // fully and always updating `best` when we find an echo leaves us with the
-    // leftmost (= longest match = smallest pos) echoing candidate.
-    let mut best: Option<(usize, MessageType)> = None;
-    for &(pos, ref kind) in &candidates {
-        let msg = &bytes[pos..n];
-        if msg.len() <= pos && bytes[..pos].windows(msg.len()).any(|w| w == msg) {
-            best = Some((pos, kind.clone()));
-        }
-    }
-    if let Some((pos, kind)) = best {
-        return Ok((pos, kind));
-    }
-
-    // Fallback: rightmost candidate with a valid LEB128 terminator before it.
-    for &(pos, ref kind) in &candidates {
-        if bytes[pos - 1] & 0x80 == 0 {
-            return Ok((pos, kind.clone()));
-        }
-    }
-
-    // Last resort: rightmost structural candidate.
-    let (pos, kind) = &candidates[0];
-    Ok((*pos, kind.clone()))
 }
 
 // ---------------------------------------------------------------------------
