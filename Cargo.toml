@@ -1,0 +1,15 @@
+[package]
+name = "outbox-proof-utils"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "outbox-proof-utils"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+nom = "7.1"
+num-bigint = "0.4"
+tezos_data_encoding = { git = "https://gitlab.com/tezos/tezos.git" }
