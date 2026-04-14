@@ -181,44 +181,36 @@ fn find_message_start(bytes: &[u8]) -> Result<(usize, MessageType), ParseError> 
         return Err(ParseError::MessageNotFound);
     }
 
-    // Score each candidate on two independent signals:
+    // Pick the candidate whose message bytes form the longest match inside the
+    // Irmin proof section (i.e. bytes[pos..n] appears verbatim in bytes[0..pos]).
     //
-    // Signal A — LEB128 terminator (hard structural constraint):
-    //   The byte immediately before msg_start is the last byte of the
-    //   message_index LEB128, so it must have MSB=0.
+    // The Irmin proof embeds the outbox message bytes as a leaf-node value, so
+    // the true msg_start produces a long echo (all message bytes). False
+    // positives produce a short echo or none at all — a coincidental byte
+    // sequence of just a few bytes is far less distinctive.
     //
-    // Signal B — Irmin-section echo (Irmin proof embeds message bytes verbatim):
-    //   bytes[pos..n] (the serialised message) should appear in bytes[0..pos]
-    //   because the Irmin proof stores the leaf value (the message) verbatim.
-    //
-    // Priority: (A+B) > (A only) > (B only) > neither.
-    // Within a priority tier, candidates is ordered right-to-left so the first
-    // match is the rightmost.
-    let echo = |pos: usize| -> bool {
+    // `candidates` is ordered right-to-left (largest pos first). Iterating it
+    // fully and always updating `best` when we find an echo leaves us with the
+    // leftmost (= longest match = smallest pos) echoing candidate.
+    let mut best: Option<(usize, MessageType)> = None;
+    for &(pos, ref kind) in &candidates {
         let msg = &bytes[pos..n];
-        msg.len() <= pos && bytes[..pos].windows(msg.len()).any(|w| w == msg)
-    };
-    let msb_ok = |pos: usize| -> bool { bytes[pos - 1] & 0x80 == 0 };
+        if msg.len() <= pos && bytes[..pos].windows(msg.len()).any(|w| w == msg) {
+            best = Some((pos, kind.clone()));
+        }
+    }
+    if let Some((pos, kind)) = best {
+        return Ok((pos, kind));
+    }
 
-    // Tier 1: both signals
+    // Fallback: rightmost candidate with a valid LEB128 terminator before it.
     for &(pos, ref kind) in &candidates {
-        if msb_ok(pos) && echo(pos) {
+        if bytes[pos - 1] & 0x80 == 0 {
             return Ok((pos, kind.clone()));
         }
     }
-    // Tier 2: LEB128 terminator only (stronger structural signal)
-    for &(pos, ref kind) in &candidates {
-        if msb_ok(pos) {
-            return Ok((pos, kind.clone()));
-        }
-    }
-    // Tier 3: Irmin echo only
-    for &(pos, ref kind) in &candidates {
-        if echo(pos) {
-            return Ok((pos, kind.clone()));
-        }
-    }
-    // Last resort: rightmost structural candidate
+
+    // Last resort: rightmost structural candidate.
     let (pos, kind) = &candidates[0];
     Ok((*pos, kind.clone()))
 }
