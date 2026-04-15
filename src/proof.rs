@@ -138,19 +138,20 @@ pub fn parse_bytes(bytes: &[u8]) -> Result<OutputMetadata, ParseError> {
 
 /// Return the start position of the outbox message union and its type.
 ///
-/// Scans left-to-right (longest possible suffix first). For each position:
+/// Scans left-to-right (longest candidate first). For each position `pos` we
+/// require **both** signals to hold simultaneously:
 ///
-/// 1. **Irmin echo**: check that `bytes[pos..n]` appears verbatim somewhere in
-///    `bytes[0..pos]`. The Irmin proof stores the outbox message as a leaf-node
-///    value, so the true msg_start produces a long match; false positives from
-///    coincidental byte patterns produce only short matches.
+/// 1. **Prefixed Irmin echo** — the Irmin proof stores the outbox message as a
+///    `Dynamic_size` leaf: `[4-byte BE length][message bytes]`. We search for
+///    exactly that pair in `bytes[0..pos]`, which rules out false positives that
+///    happen to echo the raw bytes but without the matching 4-byte size prefix.
 ///
-/// 2. **Structure**: check that the suffix starts with a valid union tag and
-///    that the `Dynamic_size` list-length field (or the `0x00` None sentinel)
+/// 2. **Structure** — `bytes[pos]` is a known union tag (0/1/2) and the
+///    `Dynamic_size` list-length field (or `0x00` None sentinel for whitelist)
 ///    is consistent with the remaining bytes.
 ///
-/// Both signals must hold. If either fails we shrink the candidate by one byte
-/// (increment pos) and try again, naturally converging on the true split point.
+/// If either fails we shrink the candidate by one byte (increment `pos`) and try
+/// again, converging on the true split point.
 fn find_message_start(bytes: &[u8]) -> Result<(usize, MessageType), ParseError> {
     let n = bytes.len();
 
@@ -158,29 +159,22 @@ fn find_message_start(bytes: &[u8]) -> Result<(usize, MessageType), ParseError> 
     for pos in 5..n {
         let msg = &bytes[pos..n];
 
-        // Echo check: suffix must fit inside the prefix and appear there.
-        if msg.len() > pos {
-            continue;
-        }
-        if !bytes[..pos].windows(msg.len()).any(|w| w == msg) {
-            continue;
-        }
+        // Structure check (cheap, short-circuits the window scan).
+        let kind = match message_kind(msg) {
+            Some(k) => k,
+            None => continue,
+        };
 
-        // Structure check: must start with a valid tag and have consistent framing.
-        if let Some(kind) = message_kind(msg) {
-            return Ok((pos, kind));
+        // Prefixed echo check: [BE-u32(msg.len())][msg] must appear in bytes[0..pos].
+        let prefix: [u8; 4] = (msg.len() as u32).to_be_bytes();
+        let needle_len = 4 + msg.len();
+        if needle_len > pos {
+            continue; // Irmin proof section too short to contain the needle
         }
-    }
-
-    // Fallback for proofs where the Irmin section doesn't embed the message
-    // verbatim (e.g. blinded/hashed leaf nodes). Revert to the structural scan
-    // with the LEB128 MSB-0 filter.
-    for pos in (5..n).rev() {
-        if bytes[pos - 1] & 0x80 != 0 {
-            continue;
-        }
-        let msg = &bytes[pos..n];
-        if let Some(kind) = message_kind(msg) {
+        let echoed = bytes[..pos]
+            .windows(needle_len)
+            .any(|w| w[..4] == prefix && &w[4..] == msg);
+        if echoed {
             return Ok((pos, kind));
         }
     }
@@ -270,18 +264,26 @@ fn narith_to_u64(n: Narith) -> Result<u64, ParseError> {
 mod tests {
     use super::*;
 
-    /// Build a synthetic outbox proof in the REAL binary format:
-    ///   [irmin][outbox_level: 4 BE][leb128_index][tag][message_body]
+    /// Build a synthetic outbox proof that matches the real binary format.
     ///
-    /// For the Irmin-echo confirmation to work on these synthetic tests, the
-    /// `irmin` slice must contain the message bytes (`[tag][message_body]`).
-    fn build_proof(irmin: &[u8], level: u32, idx: &[u8], tag: u8, body: &[u8]) -> Vec<u8> {
+    /// Layout:
+    ///   [irmin_prefix]
+    ///   [4-byte BE msg_len][tag][body]   ← Dynamic_size leaf echo inside Irmin proof
+    ///   [outbox_level: 4 bytes BE]
+    ///   [leb128_index]
+    ///   [tag][body]                       ← the actual output_proof_output message
+    fn build_proof(irmin_prefix: &[u8], level: u32, idx: &[u8], tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut msg = vec![tag];
+        msg.extend_from_slice(body);
         let mut out = Vec::new();
-        out.extend_from_slice(irmin);
+        // Irmin section: arbitrary prefix bytes then the 4-byte-prefixed leaf echo
+        out.extend_from_slice(irmin_prefix);
+        out.extend_from_slice(&(msg.len() as u32).to_be_bytes());
+        out.extend_from_slice(&msg);
+        // output_proof_output
         out.extend_from_slice(&level.to_be_bytes());
         out.extend_from_slice(idx);
-        out.push(tag);
-        out.extend_from_slice(body);
+        out.extend_from_slice(&msg);
         out
     }
 
@@ -308,22 +310,9 @@ mod tests {
 
     // ── Test 1 ────────────────────────────────────────────────────────────────
     // level=100000, index=5, AtomicTransactionBatch, empty list.
-    // Irmin placeholder echoes the message bytes so the confirmation fires.
     #[test]
     fn test_atomic_transaction_batch() {
-        let tag: u8 = 0;
-        let body = list_body(&[]);
-        // Irmin placeholder contains the echo of [tag][body]
-        let mut irmin = vec![0xAB, 0xCD];
-        irmin.push(tag);
-        irmin.extend_from_slice(&body);
-        irmin.extend_from_slice(&[0xEF]);
-
-        let proof = build_proof(&irmin, 100_000, &leb128(5), tag, &body);
-        // 2(pad) + 1(tag) + 4(list_len=0) + 1(pad) = 8 irmin bytes
-        // + 4 level + 1 idx + 1 tag + 4 list_len = 10 payload bytes
-        assert_eq!(proof.len(), 18);
-
+        let proof = build_proof(&[0xAB, 0xCD], 100_000, &leb128(5), 0, &list_body(&[]));
         let meta = parse_bytes(&proof).expect("parse failed");
         assert_eq!(meta, OutputMetadata {
             outbox_level: 100_000,
@@ -333,18 +322,17 @@ mod tests {
     }
 
     // ── Test 2 ────────────────────────────────────────────────────────────────
-    // level=50_000_000 (lower bytes have MSB=1 — tricky LEB128 boundary),
-    // index=0, AtomicTransactionBatch with 4 transaction bytes.
+    // level=50_000_000 (lower bytes have MSB=1 — exercises LEB128 boundary),
+    // index=0, AtomicTransactionBatch with 4 bytes of transaction data.
     #[test]
     fn test_high_level_index_zero() {
-        let tag: u8 = 0;
-        let tx = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        let body = list_body(&tx);
-        let mut irmin = vec![0x03, 0x00, 0x02]; // realistic compact proof prefix
-        irmin.push(tag);
-        irmin.extend_from_slice(&body);
-
-        let proof = build_proof(&irmin, 50_000_000, &leb128(0), tag, &body);
+        let proof = build_proof(
+            &[0x03, 0x00, 0x02],
+            50_000_000,
+            &leb128(0),
+            0,
+            &list_body(&[0xDE, 0xAD, 0xBE, 0xEF]),
+        );
         let meta = parse_bytes(&proof).expect("parse failed");
         assert_eq!(meta.outbox_level, 50_000_000);
         assert_eq!(meta.message_index, 0);
@@ -355,13 +343,7 @@ mod tests {
     // Typed batch (tag 1).
     #[test]
     fn test_typed_batch() {
-        let tag: u8 = 1;
-        let body = list_body(&[]);
-        let mut irmin = vec![0xFF];
-        irmin.push(tag);
-        irmin.extend_from_slice(&body);
-
-        let proof = build_proof(&irmin, 42, &leb128(0), tag, &body);
+        let proof = build_proof(&[0xFF], 42, &leb128(0), 1, &list_body(&[]));
         let meta = parse_bytes(&proof).expect("parse failed");
         assert_eq!(meta.message_type, MessageType::AtomicTransactionBatchTyped);
     }
