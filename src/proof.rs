@@ -57,7 +57,6 @@ pub enum MessageType {
     AtomicTransactionBatch,
     AtomicTransactionBatchTyped,
     WhitelistUpdate,
-    Unknown(u8),
 }
 
 impl fmt::Display for MessageType {
@@ -66,7 +65,6 @@ impl fmt::Display for MessageType {
             Self::AtomicTransactionBatch => write!(f, "AtomicTransactionBatch"),
             Self::AtomicTransactionBatchTyped => write!(f, "AtomicTransactionBatchTyped"),
             Self::WhitelistUpdate => write!(f, "WhitelistUpdate"),
-            Self::Unknown(t) => write!(f, "Unknown({t})"),
         }
     }
 }
