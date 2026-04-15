@@ -26,27 +26,24 @@
 //! ## Finding the split point
 //!
 //! The Irmin proof has no framing, so we cannot tell directly where it ends.
-//! Instead we use two signals:
+//! We scan left-to-right and require both signals simultaneously:
 //!
-//! 1. **Structural**: find position `pos` where `bytes[pos]` is a valid union
-//!    tag and the `Dynamic_size` list-length field is consistent with the
-//!    remaining bytes (i.e. `pos + header + L == total_len`).
+//! 1. **Structure** — `bytes[pos]` is a known union tag (0/1/2) and the
+//!    `Dynamic_size` list-length field is consistent with the remaining bytes.
 //!
-//! 2. **Irmin confirmation**: the WASM Irmin proof embeds the outbox message
-//!    bytes verbatim as a leaf-node value (it proves the message exists in
-//!    durable storage). So `bytes[pos..end]` should appear again somewhere
-//!    inside `bytes[0..pos]` (the Irmin proof section). False positives
-//!    inside the transaction data do not have this property.
+//! 2. **Prefixed Irmin echo** — the Irmin proof stores the outbox message as a
+//!    `Dynamic_size` leaf: `[4-byte BE length][message bytes]`. We search for
+//!    exactly that pair in `bytes[0..pos]`.
 //!
-//! We scan right-to-left, collecting structural candidates, then prefer the
-//! rightmost one confirmed by the Irmin-section echo. If no echo is found we
-//! fall back to the rightmost structural candidate that has a valid LEB128
-//! terminator (MSB=0) in the byte immediately before it.
+//! ## message_index encoding
+//!
+//! The protocol constant `max_outbox_messages_per_level` has only ever been set
+//! to 100, so `message_index` is always in [0, 99]. Since 99 < 128, the LEB128
+//! encoding is always a single byte (MSB=0). The byte at `bytes[msg_start - 1]`
+//! is therefore the complete index, and `bytes[msg_start - 5..msg_start - 1]`
+//! is always the outbox level.
 
 use std::fmt;
-
-use tezos_data_encoding::nom::NomReader;
-use tezos_data_encoding::types::Narith;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -85,9 +82,6 @@ pub enum ParseError {
     Hex(hex::FromHexError),
     TooShort,
     MessageNotFound,
-    NarithDecode(String),
-    NarithOverflow,
-    LevelNotFound,
 }
 
 impl fmt::Display for ParseError {
@@ -96,9 +90,6 @@ impl fmt::Display for ParseError {
             Self::Hex(e) => write!(f, "hex decode error: {e}"),
             Self::TooShort => write!(f, "input too short"),
             Self::MessageNotFound => write!(f, "could not locate outbox message — no consistent tag+length anchor found"),
-            Self::NarithDecode(msg) => write!(f, "message_index LEB128 decode: {msg}"),
-            Self::NarithOverflow => write!(f, "message_index too large for u64"),
-            Self::LevelNotFound => write!(f, "insufficient bytes before message_index for outbox_level"),
         }
     }
 }
@@ -123,11 +114,11 @@ pub fn parse_bytes(bytes: &[u8]) -> Result<OutputMetadata, ParseError> {
         return Err(ParseError::TooShort);
     }
     let (msg_start, message_type) = find_message_start(bytes)?;
-    let (leb_start, message_index) = find_leb128_before(bytes, msg_start)?;
-    if leb_start < 4 {
-        return Err(ParseError::LevelNotFound);
-    }
-    let level_slice: [u8; 4] = bytes[leb_start - 4..leb_start].try_into().unwrap();
+    // msg_start >= 5 is guaranteed by find_message_start (pos starts at 5).
+    // max_outbox_messages_per_level has only ever been 100, so message_index
+    // is always in [0, 99] — a single LEB128 byte (MSB=0) at msg_start - 1.
+    let message_index = bytes[msg_start - 1] as u64;
+    let level_slice: [u8; 4] = bytes[msg_start - 5..msg_start - 1].try_into().unwrap();
     let outbox_level = i32::from_be_bytes(level_slice) as u32;
     Ok(OutputMetadata { outbox_level, message_index, message_type })
 }
@@ -221,42 +212,6 @@ fn message_kind(msg: &[u8]) -> Option<MessageType> {
 }
 
 // ---------------------------------------------------------------------------
-// LEB128 backwards resolution
-// ---------------------------------------------------------------------------
-
-/// Given that a LEB128 varint ends at byte `end` (exclusive), find where it
-/// starts and decode its value.
-///
-/// Tries lengths 1..=9. A valid LEB128 of length L has:
-/// - bytes[end-L .. end-1]: MSB=1 (continuation bytes)
-/// - bytes[end-1]:           MSB=0 (terminal byte)
-fn find_leb128_before(bytes: &[u8], end: usize) -> Result<(usize, u64), ParseError> {
-    for leb_len in 1usize..=9 {
-        if end < leb_len + 4 {
-            break;
-        }
-        let start = end - leb_len;
-        let leb = &bytes[start..end];
-        let valid = leb[leb_len - 1] & 0x80 == 0
-            && (0..leb_len - 1).all(|i| leb[i] & 0x80 != 0);
-        if !valid {
-            continue;
-        }
-        let (_, narith) = Narith::nom_read(leb)
-            .map_err(|e| ParseError::NarithDecode(format!("{e:?}")))?;
-        return Ok((start, narith_to_u64(narith)?));
-    }
-    Err(ParseError::NarithDecode(
-        "no valid LEB128 terminator before message".into(),
-    ))
-}
-
-fn narith_to_u64(n: Narith) -> Result<u64, ParseError> {
-    let big: num_bigint::BigUint = n.into();
-    big.try_into().map_err(|_| ParseError::NarithOverflow)
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -270,9 +225,9 @@ mod tests {
     ///   [irmin_prefix]
     ///   [4-byte BE msg_len][tag][body]   ← Dynamic_size leaf echo inside Irmin proof
     ///   [outbox_level: 4 bytes BE]
-    ///   [leb128_index]
+    ///   [idx: 1 byte]                    ← message_index (always single byte, 0–99)
     ///   [tag][body]                       ← the actual output_proof_output message
-    fn build_proof(irmin_prefix: &[u8], level: u32, idx: &[u8], tag: u8, body: &[u8]) -> Vec<u8> {
+    fn build_proof(irmin_prefix: &[u8], level: u32, idx: u8, tag: u8, body: &[u8]) -> Vec<u8> {
         let mut msg = vec![tag];
         msg.extend_from_slice(body);
         let mut out = Vec::new();
@@ -282,23 +237,8 @@ mod tests {
         out.extend_from_slice(&msg);
         // output_proof_output
         out.extend_from_slice(&level.to_be_bytes());
-        out.extend_from_slice(idx);
+        out.push(idx);
         out.extend_from_slice(&msg);
-        out
-    }
-
-    fn leb128(mut n: u64) -> Vec<u8> {
-        let mut out = Vec::new();
-        loop {
-            let byte = (n & 0x7f) as u8;
-            n >>= 7;
-            if n == 0 {
-                out.push(byte);
-                break;
-            } else {
-                out.push(byte | 0x80);
-            }
-        }
         out
     }
 
@@ -312,7 +252,7 @@ mod tests {
     // level=100000, index=5, AtomicTransactionBatch, empty list.
     #[test]
     fn test_atomic_transaction_batch() {
-        let proof = build_proof(&[0xAB, 0xCD], 100_000, &leb128(5), 0, &list_body(&[]));
+        let proof = build_proof(&[0xAB, 0xCD], 100_000, 5, 0, &list_body(&[]));
         let meta = parse_bytes(&proof).expect("parse failed");
         assert_eq!(meta, OutputMetadata {
             outbox_level: 100_000,
@@ -329,7 +269,7 @@ mod tests {
         let proof = build_proof(
             &[0x03, 0x00, 0x02],
             50_000_000,
-            &leb128(0),
+            0,
             0,
             &list_body(&[0xDE, 0xAD, 0xBE, 0xEF]),
         );
@@ -343,7 +283,7 @@ mod tests {
     // Typed batch (tag 1).
     #[test]
     fn test_typed_batch() {
-        let proof = build_proof(&[0xFF], 42, &leb128(0), 1, &list_body(&[]));
+        let proof = build_proof(&[0xFF], 42, 0, 1, &list_body(&[]));
         let meta = parse_bytes(&proof).expect("parse failed");
         assert_eq!(meta.message_type, MessageType::AtomicTransactionBatchTyped);
     }
