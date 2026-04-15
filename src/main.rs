@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Trilitech <contact@trili.tech>
+//
 // SPDX-License-Identifier: MIT
 
 mod proof;
